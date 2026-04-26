@@ -1,0 +1,275 @@
+CREATE DATABASE TastyBitez;
+GO
+
+USE TastyBitez;
+GO
+
+-- Create Customers Table
+CREATE TABLE Customers (
+    CustomerID INT IDENTITY(1,1) PRIMARY KEY,
+    FullName VARCHAR(100) NOT NULL,
+    PhoneNumber VARCHAR(15) UNIQUE NOT NULL,
+    Email VARCHAR(100) UNIQUE NOT NULL
+);
+
+-- Create MenuItems Table
+CREATE TABLE MenuItems (
+    MenuItemID INT IDENTITY(1,1) PRIMARY KEY,
+    ItemName VARCHAR(50) UNIQUE NOT NULL,
+    Price DECIMAL(10,2) CHECK (Price > 0) NOT NULL
+);
+
+-- Create Inventory Table
+CREATE TABLE Inventory (
+    InventoryID INT IDENTITY(1,1) PRIMARY KEY,
+    MenuItemID INT NOT NULL UNIQUE,
+    StockLevel INT NOT NULL CHECK (StockLevel >= 0),
+    FOREIGN KEY (MenuItemID) REFERENCES MenuItems(MenuItemID) ON DELETE CASCADE
+);
+
+-- Create Orders Table
+CREATE TABLE Orders (
+    OrderID INT IDENTITY(1,1) PRIMARY KEY,
+    CustomerID INT NOT NULL,
+    OrderDate DATETIME DEFAULT GETDATE(),
+    Status VARCHAR(20) NOT NULL DEFAULT 'Pending' CHECK (Status IN ('Pending', 'Completed', 'Cancelled')),
+    FOREIGN KEY (CustomerID) REFERENCES Customers(CustomerID) ON DELETE CASCADE
+);
+
+-- Create OrderItems Table
+CREATE TABLE OrderItems (
+    ItemID INT IDENTITY(1,1) PRIMARY KEY,
+    OrderID INT NOT NULL,
+    MenuItemID INT NOT NULL,
+    Quantity INT CHECK (Quantity > 0) NOT NULL,
+    FOREIGN KEY (OrderID) REFERENCES Orders(OrderID) ON DELETE CASCADE,
+    FOREIGN KEY (MenuItemID) REFERENCES MenuItems(MenuItemID)
+);
+
+-- Create Payments Table
+CREATE TABLE Payments (
+    PaymentID INT IDENTITY(1,1) PRIMARY KEY,
+    OrderID INT NOT NULL,
+    AmountPaid DECIMAL(10,2) CHECK (AmountPaid >= 0) NOT NULL,
+    PaymentDate DATETIME DEFAULT GETDATE(),
+    FOREIGN KEY (OrderID) REFERENCES Orders(OrderID) ON DELETE CASCADE
+);
+
+-- Indexes
+CREATE NONCLUSTERED INDEX idx_customer_email ON Customers (Email);
+CREATE NONCLUSTERED INDEX idx_order_status ON Orders (Status);
+CREATE NONCLUSTERED INDEX idx_menu_price ON MenuItems (Price);
+go;
+-- Triggers
+-- Auto-create inventory entry for new menu items
+CREATE TRIGGER trg_CreateInventoryEntry
+ON MenuItems
+AFTER INSERT
+AS
+BEGIN
+    INSERT INTO Inventory (MenuItemID, StockLevel)
+    SELECT MenuItemID, 0 FROM inserted;
+END;
+GO
+
+-- Trigger to Restore Stock on Order Cancellation
+CREATE TRIGGER trg_RestoreStockOnCancel
+ON Orders
+AFTER UPDATE
+AS
+BEGIN
+    IF UPDATE(Status)
+    BEGIN
+        -- Aggregate quantities for all cancelled orders
+        WITH CancelledOrders AS (
+            SELECT ins.OrderID
+            FROM inserted ins
+            JOIN deleted del ON ins.OrderID = del.OrderID
+            WHERE ins.Status = 'Cancelled' AND del.Status <> 'Cancelled'
+        ),
+        OrderQuantities AS (
+            SELECT oi.MenuItemID, SUM(oi.Quantity) AS TotalQuantity
+            FROM OrderItems oi
+            JOIN CancelledOrders co ON oi.OrderID = co.OrderID
+            GROUP BY oi.MenuItemID
+        )
+        -- Update Inventory
+        UPDATE i
+        SET StockLevel = StockLevel + oq.TotalQuantity
+        FROM Inventory i
+        JOIN OrderQuantities oq ON i.MenuItemID = oq.MenuItemID;
+    END;
+END;
+GO
+
+
+ --Auto-update inventory on order placement
+CREATE TRIGGER trg_UpdateStock
+ON OrderItems
+AFTER INSERT
+AS
+BEGIN
+    UPDATE i
+    SET StockLevel = StockLevel - totals.Quantity
+    FROM Inventory i
+    JOIN (
+        SELECT MenuItemID, SUM(Quantity) AS Quantity
+        FROM inserted
+        GROUP BY MenuItemID
+    ) totals ON i.MenuItemID = totals.MenuItemID;
+END;
+GO;
+
+
+
+-- Revised PlaceOrder Procedure
+CREATE PROCEDURE PlaceOrder
+    @CustomerID INT,
+    @MenuItemID INT,
+    @Quantity INT
+AS
+BEGIN
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        
+        DECLARE @Stock INT;
+        SELECT @Stock = StockLevel FROM Inventory WHERE MenuItemID = @MenuItemID;
+        
+        IF @Stock < @Quantity
+        BEGIN
+            RAISERROR ('Not enough stock available.', 16, 1);
+            ROLLBACK TRANSACTION;
+            RETURN;
+        END;
+        
+        DECLARE @NewOrderID INT;
+        INSERT INTO Orders (CustomerID, Status) VALUES (@CustomerID, 'Pending');
+        SET @NewOrderID = SCOPE_IDENTITY();
+        
+        INSERT INTO OrderItems (OrderID, MenuItemID, Quantity) 
+        VALUES (@NewOrderID, @MenuItemID, @Quantity);
+        
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        ROLLBACK TRANSACTION;
+        PRINT ERROR_MESSAGE();
+    END CATCH
+END;
+GO
+
+
+
+-- Restock Inventory
+CREATE PROCEDURE RestockItem
+    @MenuItemID INT,
+    @Quantity INT
+AS
+BEGIN
+    IF @Quantity <= 0
+    BEGIN
+        RAISERROR ('Quantity must be greater than 0.', 16, 1);
+        RETURN;
+    END;
+
+    UPDATE Inventory
+    SET StockLevel = StockLevel + @Quantity
+    WHERE MenuItemID = @MenuItemID;
+END;
+GO
+
+-- Update Order Status
+CREATE PROCEDURE UpdateOrderStatus
+    @OrderID INT,
+    @NewStatus VARCHAR(20)
+AS
+BEGIN
+    IF @NewStatus NOT IN ('Pending', 'Completed', 'Cancelled')
+    BEGIN
+        RAISERROR ('Invalid status value.', 16, 1);
+        RETURN;
+    END;
+    
+    UPDATE Orders
+    SET Status = @NewStatus
+    WHERE OrderID = @OrderID;
+END;
+GO
+
+-- Process Payment
+CREATE PROCEDURE ProcessPayment
+    @OrderID INT,
+    @AmountPaid DECIMAL(10,2)
+AS
+BEGIN
+    INSERT INTO Payments (OrderID, AmountPaid)
+    VALUES (@OrderID, @AmountPaid);
+END;
+GO
+
+
+-- Sample Data
+INSERT INTO Customers (FullName, PhoneNumber, Email) VALUES
+('Oarabeng Khunou', '0123456789', 'oarabengkhunou@gmail.com'),
+('Dithego Mashiane', '0837654321', 'dithegomashiane@gmail.com'),
+('Reitumetse Given Moreke', '0711222353', 'reitumetsemoreke@gmail.com');
+
+INSERT INTO MenuItems (ItemName, Price) VALUES
+('Burger', 50.00),
+('Kota', 40.00),
+('Grilled Meat', 100.00);
+
+-- Restock initial quantities
+EXEC RestockItem @MenuItemID = 1, @Quantity = 20;
+EXEC RestockItem @MenuItemID = 2, @Quantity = 15;
+EXEC RestockItem @MenuItemID = 3, @Quantity = 10;
+
+-- Create orders
+EXEC PlaceOrder @CustomerID = 1, @MenuItemID = 1, @Quantity = 2;
+EXEC PlaceOrder @CustomerID = 2, @MenuItemID = 3, @Quantity = 1;
+
+-- Process payments
+EXEC ProcessPayment @OrderID = 1, @AmountPaid = 100.00;
+EXEC ProcessPayment @OrderID = 2, @AmountPaid = 100.00;
+
+Go
+-- Views
+CREATE VIEW CustomerOrders AS
+SELECT c.FullName, o.OrderID, o.OrderDate, o.Status
+FROM Customers c
+JOIN Orders o ON c.CustomerID = o.CustomerID;
+GO
+
+CREATE VIEW OrderDetails AS
+SELECT o.OrderID, m.ItemName, oi.Quantity, m.Price, (oi.Quantity * m.Price) AS TotalPrice
+FROM OrderItems oi
+JOIN MenuItems m ON oi.MenuItemID = m.MenuItemID
+JOIN Orders o ON oi.OrderID = o.OrderID;
+GO
+
+CREATE VIEW CustomerOrderHistory AS
+SELECT 
+    c.FullName, 
+    o.OrderID, 
+    o.OrderDate, 
+    SUM(oi.Quantity * m.Price) AS TotalSpent
+FROM Customers c
+JOIN Orders o ON c.CustomerID = o.CustomerID
+JOIN OrderItems oi ON o.OrderID = oi.OrderID
+JOIN MenuItems m ON oi.MenuItemID = m.MenuItemID
+GROUP BY c.FullName, o.OrderID, o.OrderDate;
+GO
+
+-- Create Roles and Assign Permissions
+CREATE ROLE StaffRole;
+GRANT SELECT, INSERT ON Orders TO StaffRole;
+GRANT SELECT, INSERT ON OrderItems TO StaffRole;
+DENY DELETE, UPDATE ON Orders TO StaffRole;
+DENY DELETE, UPDATE ON OrderItems TO StaffRole;
+DENY ALL ON Payments TO StaffRole;
+GO
+
+-- Backup
+BACKUP DATABASE TastyBitez
+TO DISK = 'C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\Backup\TastyBitez.bak'
+WITH FORMAT, INIT;
